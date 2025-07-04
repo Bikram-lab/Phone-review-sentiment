@@ -1,0 +1,2005 @@
+---
+title: "Individual Project"
+author: "Bikramjeet Singh"
+date: "`r Sys.Date()`"
+output:
+  word_document: default
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    theme: readable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# Load required libraries
+required_packages <- c(
+  "dplyr", "tidyr", "ggplot2", "stringr", "tidytext", "tm", "caret",
+  "randomForest", "xgboost", "rpart", "rpart.plot", "Matrix", "glmnet",
+  "pROC", "corrplot", "textdata", "RColorBrewer", "ranger", "purrr", "tibble",
+  "arules", "arulesViz", "MASS", "klaR",
+  "cluster", "factoextra", "dbscan", "fpc", "FactoMineR", "proxy","NbClust"
+)
+
+for (pkg in required_packages) {
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg, dependencies = TRUE)
+    library(pkg, character.only = TRUE)
+  }
+}
+
+set.seed(2021)
+options(digits = 4)
+```
+
+# Introduction
+
+This analysis implements advanced text classification techniques including TF-IDF feature engineering, association rules mining, and multiple discriminant analysis approaches on phone review data to achieve optimal sentiment classification performance.
+
+# Data Preparation
+
+```{r data_loading}
+# Load and combine datasets
+df1 <- read.csv("C:/Users/bikra/OneDrive - Northeastern University/Documents/Neu/ALY 6040/Week1/Individual Project/Dataset/phone_user_review_file_1.csv", 
+                header = TRUE, sep = ",", stringsAsFactors = FALSE)
+df2 <- read.csv("C:/Users/bikra/OneDrive - Northeastern University/Documents/Neu/ALY 6040/Week1/Individual Project/Dataset/phone_user_review_file_2.csv", 
+                header = TRUE, sep = ",", stringsAsFactors = FALSE)
+
+# Filter and prepare data
+combined_df <- bind_rows(df1, df2) %>%
+  filter(lang == "en", !is.na(extract), !is.na(score)) %>%
+  dplyr::select(score, extract, product) %>%
+  mutate(
+    sentiment_class = case_when(
+      score < 4 ~ 0,   # Negative
+      score <= 6 ~ 1,  # Neutral  
+      score > 6 ~ 2    # Positive
+    ),
+    sentiment_label = case_when(
+      sentiment_class == 0 ~ "Negative",
+      sentiment_class == 1 ~ "Neutral", 
+      sentiment_class == 2 ~ "Positive"
+    )
+  )
+
+rm(df1, df2)
+gc()
+
+# Balanced sampling
+set.seed(2021)
+stratified_sample <- combined_df %>%
+  group_by(sentiment_class) %>%
+  sample_n(min(n(), 40000)) %>%
+  ungroup()
+
+print(table(stratified_sample$sentiment_label))
+```
+
+# Exploratory Data Analysis
+
+```{r eda_basic_stats}
+# Table 1: Basic Dataset Statistics
+basic_stats <- data.frame(
+  Metric = c("Total Reviews", "Average Score", "Score Range", "Average Review Length", 
+             "Average Word Count", "Negative Reviews", "Neutral Reviews", "Positive Reviews"),
+  Value = c(
+    format(nrow(stratified_sample), big.mark = ","),
+    round(mean(stratified_sample$score), 2),
+    paste(min(stratified_sample$score), "-", max(stratified_sample$score)),
+    round(mean(nchar(stratified_sample$extract)), 0),
+    round(mean(str_count(stratified_sample$extract, "\\S+")), 0),
+    format(sum(stratified_sample$sentiment_class == 0), big.mark = ","),
+    format(sum(stratified_sample$sentiment_class == 1), big.mark = ","),
+    format(sum(stratified_sample$sentiment_class == 2), big.mark = ",")
+  )
+)
+
+knitr::kable(basic_stats, caption = "Table 1: Dataset Descriptive Statistics")
+```
+
+```{r eda_score_distribution, fig.cap="Figure 1: Distribution of Review Scores"}
+# Figure 1: Score Distribution
+ggplot(stratified_sample, aes(x = score)) +
+  geom_histogram(binwidth = 1, fill = "steelblue", color = "white", alpha = 0.8) +
+  labs(title = "Figure 1: Distribution of Review Scores",
+       x = "Review Score", 
+       y = "Frequency") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 12, face = "bold"))
+```
+
+```{r eda_sentiment_distribution, fig.cap="Figure 2: Sentiment Class Distribution"}
+# Figure 2: Sentiment Distribution
+sentiment_counts <- stratified_sample %>%
+  count(sentiment_label) %>%
+  mutate(percentage = round(n/sum(n)*100, 1))
+
+ggplot(sentiment_counts, aes(x = sentiment_label, y = n, fill = sentiment_label)) +
+  geom_col(alpha = 0.8) +
+  geom_text(aes(label = paste0(n, "\n(", percentage, "%)")), vjust = 0.5) +
+  labs(title = "Figure 2: Sentiment Class Distribution",
+       x = "Sentiment Class", 
+       y = "Number of Reviews") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 12, face = "bold"),
+        legend.position = "none") +
+  scale_fill_brewer(palette = "Set2")
+
+```
+
+```{r eda_score_by_sentiment, fig.cap="Figure 3: Score Distribution by Sentiment Class"}
+# Figure 3: Score by Sentiment
+ggplot(stratified_sample, aes(x = sentiment_label, y = score, fill = sentiment_label)) +
+  geom_boxplot(alpha = 0.8) +
+  labs(title = "Figure 3: Score Distribution by Sentiment Class",
+       x = "Sentiment Class", 
+       y = "Review Score") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 12, face = "bold"),
+        legend.position = "none") +
+  scale_fill_brewer(palette = "Set2")
+```
+
+```{r eda_review_length, fig.cap="Figure 4: Review Length Distribution"}
+# Figure 4: Review Length Analysis
+stratified_sample$review_length <- nchar(stratified_sample$extract)
+stratified_sample$word_count <- str_count(stratified_sample$extract, "\\S+")
+
+ggplot(stratified_sample, aes(x = review_length)) +
+  geom_histogram(bins = 50, fill = "darkorange", alpha = 0.65) +
+  labs(title = "Figure 4: Review Length Distribution (Characters)",
+       x = "Review Length (Characters)", 
+       y = "Frequency") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 12, face = "bold")) +
+  xlim(0, quantile(stratified_sample$review_length, 0.95))
+```
+
+```{r eda_correlation_table}
+# Table 2: Correlation between Review Characteristics and Sentiment
+correlation_data <- stratified_sample %>%
+  dplyr::select(sentiment_class, score, review_length, word_count) %>%
+  mutate(sentiment_numeric = as.numeric(sentiment_class))
+
+cor_matrix <- cor(correlation_data[, c("sentiment_numeric", "score", "review_length", "word_count")])
+cor_df <- data.frame(
+  Variable = c("Score", "Review Length", "Word Count"),
+  Correlation_with_Sentiment = round(cor_matrix[1, c("score", "review_length", "word_count")], 3)
+)
+
+knitr::kable(cor_df, caption = "Table 2: Correlation between Variables and Sentiment")
+```
+
+# Text Preprocessing
+
+```{r text_preprocessing}
+# Text truncation function
+truncate_text_vectorized <- function(text_vector, max_words = 300) {
+  sapply(text_vector, function(text) {
+    if (is.na(text) || nchar(text) == 0) return("")
+    words <- str_split(text, "\\s+")[[1]]
+    if (length(words) > max_words) {
+      paste(words[1:max_words], collapse = " ")
+    } else {
+      text
+    }
+  }, USE.NAMES = FALSE)
+}
+
+# Process reviews
+processed_reviews <- stratified_sample %>%
+  mutate(
+    doc_id = row_number(),
+    review_length = nchar(extract),
+    word_count_raw = str_count(extract, "\\S+"),
+    exclamation_count = str_count(extract, "!"),
+    question_count = str_count(extract, "\\?"),
+    caps_ratio = pmin(str_count(extract, "[A-Z]") / nchar(extract), 1),
+    caps_ratio = ifelse(is.infinite(caps_ratio) | is.na(caps_ratio), 0, caps_ratio),
+    
+    review_clean = truncate_text_vectorized(extract, max_words = 300),
+    review_clean = review_clean %>%
+      str_to_lower() %>%
+      str_replace_all("[^a-z\\s]", " ") %>%
+      str_replace_all("\\s+", " ") %>%
+      str_trim(),
+    
+    word_count = str_count(review_clean, "\\S+")
+  ) %>%
+  filter(word_count > 5)
+```
+
+# TF-IDF Feature Engineering
+
+```{r tfidf_features}
+# Custom stopwords
+data("stop_words")
+custom_stopwords <- bind_rows(
+  stop_words,
+  data.frame(
+    word = c("phone", "mobile", "device", "product", "review", "star", "rating",
+             "amazon", "flipkart", "buy", "bought", "purchase", "customer", "seller"),
+    lexicon = "custom"
+  )
+)
+
+# Unigram TF-IDF
+unigram_tfidf <- processed_reviews %>%
+  dplyr::select(doc_id, review_clean) %>%
+  unnest_tokens(word, review_clean) %>%
+  anti_join(custom_stopwords, by = "word") %>%
+  count(doc_id, word) %>%
+  bind_tf_idf(word, doc_id, n)
+
+top_unigrams <- unigram_tfidf %>%
+  group_by(word) %>%
+  summarise(total_tfidf = sum(tf_idf), doc_freq = n(), .groups = 'drop') %>%
+  filter(doc_freq >= 5) %>%
+  top_n(100, total_tfidf) %>%
+  pull(word)
+
+unigram_matrix <- unigram_tfidf %>%
+  filter(word %in% top_unigrams) %>%
+  dplyr::select(doc_id, word, tf_idf) %>%
+  pivot_wider(names_from = word, values_from = tf_idf, values_fill = 0) %>%
+  column_to_rownames("doc_id")
+
+# Bigram TF-IDF
+bigram_tfidf <- processed_reviews %>%
+  dplyr::select(doc_id, review_clean) %>%
+  unnest_tokens(bigram, review_clean, token = "ngrams", n = 2) %>%
+  separate(bigram, c("word1", "word2"), sep = " ", remove = FALSE) %>%
+  filter(!word1 %in% custom_stopwords$word,
+         !word2 %in% custom_stopwords$word,
+         !is.na(word1), !is.na(word2)) %>%
+  dplyr::select(doc_id, bigram) %>%
+  count(doc_id, bigram) %>%
+  bind_tf_idf(bigram, doc_id, n)
+
+top_bigrams <- bigram_tfidf %>%
+  group_by(bigram) %>%
+  summarise(total_tfidf = sum(tf_idf), doc_freq = n(), .groups = 'drop') %>%
+  filter(doc_freq >= 3) %>%
+  top_n(50, total_tfidf) %>%
+  pull(bigram)
+
+bigram_matrix <- bigram_tfidf %>%
+  filter(bigram %in% top_bigrams) %>%
+  dplyr::select(doc_id, bigram, tf_idf) %>%
+  pivot_wider(names_from = bigram, values_from = tf_idf, values_fill = 0) %>%
+  column_to_rownames("doc_id")
+
+# Trigram TF-IDF
+trigram_tfidf <- processed_reviews %>%
+  dplyr::select(doc_id, review_clean) %>%
+  unnest_tokens(trigram, review_clean, token = "ngrams", n = 3) %>%
+  separate(trigram, c("word1", "word2", "word3"), sep = " ") %>%
+  filter(!word1 %in% custom_stopwords$word,
+         !word2 %in% custom_stopwords$word,
+         !word3 %in% custom_stopwords$word,
+         !is.na(word1), !is.na(word2), !is.na(word3)) %>%
+  unite(trigram, word1, word2, word3, sep = " ") %>%
+  count(doc_id, trigram) %>%
+  bind_tf_idf(trigram, doc_id, n)
+
+top_trigrams <- trigram_tfidf %>%
+  group_by(trigram) %>%
+  summarise(total_tfidf = sum(tf_idf), doc_freq = n(), .groups = 'drop') %>%
+  filter(doc_freq >= 2) %>%
+  top_n(30, total_tfidf) %>%
+  pull(trigram)
+
+trigram_matrix <- trigram_tfidf %>%
+  filter(trigram %in% top_trigrams) %>%
+  dplyr::select(doc_id, trigram, tf_idf) %>%
+  pivot_wider(names_from = trigram, values_from = tf_idf, values_fill = 0) %>%
+  column_to_rownames("doc_id")
+
+# Character N-grams
+char_ngrams <- processed_reviews %>%
+  dplyr::select(doc_id, review_clean) %>%
+  unnest_tokens(char_ngram, review_clean, token = "character_shingles", n = 3) %>%
+  filter(nchar(char_ngram) == 3, !str_detect(char_ngram, "\\s")) %>%
+  count(doc_id, char_ngram) %>%
+  bind_tf_idf(char_ngram, doc_id, n)
+
+top_char_ngrams <- char_ngrams %>%
+  group_by(char_ngram) %>%
+  summarise(total_tfidf = sum(tf_idf), doc_freq = n(), .groups = 'drop') %>%
+  filter(doc_freq >= 5) %>%
+  top_n(20, total_tfidf) %>%
+  pull(char_ngram)
+
+char_ngram_matrix <- char_ngrams %>%
+  filter(char_ngram %in% top_char_ngrams) %>%
+  dplyr::select(doc_id, char_ngram, tf_idf) %>%
+  pivot_wider(names_from = char_ngram, values_from = tf_idf, values_fill = 0) %>%
+  column_to_rownames("doc_id")
+```
+
+# Multi-Lexicon Sentiment Analysis
+
+```{r sentiment_analysis}
+# Load sentiment lexicons
+bing_sentiment <- get_sentiments("bing")
+afinn_sentiment <- get_sentiments("afinn")
+nrc_sentiment <- get_sentiments("nrc") %>%
+  filter(sentiment %in% c("positive", "negative", "joy", "anger", "fear", "trust"))
+
+# Tokenize reviews
+all_tokens <- processed_reviews %>%
+  dplyr::select(doc_id, review_clean) %>%
+  unnest_tokens(word, review_clean)
+
+# Bing sentiment
+bing_results <- all_tokens %>%
+  inner_join(bing_sentiment, by = "word") %>%
+  count(doc_id, sentiment) %>%
+  pivot_wider(names_from = sentiment, values_from = n, values_fill = 0) %>%
+  mutate(
+    bing_positive = ifelse("positive" %in% names(.), positive, 0),
+    bing_negative = ifelse("negative" %in% names(.), negative, 0),
+    bing_net = bing_positive - bing_negative,
+    bing_ratio = ifelse(bing_positive + bing_negative > 0, 
+                       bing_positive / (bing_positive + bing_negative), 0.5)
+  ) %>%
+  dplyr::select(doc_id, bing_positive, bing_negative, bing_net, bing_ratio)
+
+# AFINN sentiment
+afinn_results <- all_tokens %>%
+  inner_join(afinn_sentiment, by = "word") %>%
+  group_by(doc_id) %>%
+  summarise(
+    afinn_score = mean(value, na.rm = TRUE),
+    afinn_sum = sum(value, na.rm = TRUE),
+    afinn_count = n(),
+    .groups = "drop"
+  )
+
+# NRC sentiment
+nrc_results <- all_tokens %>%
+  inner_join(nrc_sentiment, by = "word") %>%
+  count(doc_id, sentiment) %>%
+  pivot_wider(names_from = sentiment, values_from = n, values_fill = 0) %>%
+  mutate(
+    nrc_positive = ifelse("positive" %in% names(.), positive, 0),
+    nrc_negative = ifelse("negative" %in% names(.), negative, 0),
+    nrc_joy = ifelse("joy" %in% names(.), joy, 0),
+    nrc_anger = ifelse("anger" %in% names(.), anger, 0),
+    nrc_fear = ifelse("fear" %in% names(.), fear, 0),
+    nrc_trust = ifelse("trust" %in% names(.), trust, 0),
+    nrc_emotional_balance = (nrc_joy + nrc_trust) - (nrc_anger + nrc_fear)
+  ) %>%
+  dplyr::select(doc_id, nrc_positive, nrc_negative, nrc_joy, nrc_anger, nrc_fear, nrc_trust, nrc_emotional_balance)
+
+# Combine sentiment features
+sentiment_features <- processed_reviews %>%
+  dplyr::select(doc_id) %>%
+  left_join(bing_results, by = "doc_id") %>%
+  left_join(afinn_results, by = "doc_id") %>%
+  left_join(nrc_results, by = "doc_id") %>%
+  mutate(
+    across(c(bing_positive, bing_negative, bing_net, bing_ratio), ~ifelse(is.na(.x), 0, .x)),
+    across(c(afinn_score, afinn_sum, afinn_count), ~ifelse(is.na(.x), 0, .x)),
+    across(c(nrc_positive, nrc_negative, nrc_joy, nrc_anger, nrc_fear, nrc_trust, nrc_emotional_balance), 
+           ~ifelse(is.na(.x), 0, .x))
+  ) %>%
+  column_to_rownames("doc_id")
+```
+
+# Feature Matrix Assembly
+
+```{r feature_assembly}
+# Find common documents
+doc_ids <- processed_reviews$doc_id
+doc_names <- as.character(doc_ids)
+
+common_docs <- intersect(intersect(intersect(doc_names, rownames(unigram_matrix)), 
+                                  rownames(bigram_matrix)), rownames(sentiment_features))
+
+# Subset matrices
+unigram_matrix_subset <- unigram_matrix[common_docs, ]
+bigram_matrix_subset <- bigram_matrix[common_docs, ]
+sentiment_features_subset <- sentiment_features[common_docs, ]
+
+processed_subset <- processed_reviews %>%
+  filter(as.character(doc_id) %in% common_docs) %>%
+  arrange(match(as.character(doc_id), common_docs))
+
+# Create feature dataframe
+feature_df <- processed_subset %>%
+  dplyr::select(sentiment_class, sentiment_label, review_length, word_count, 
+                exclamation_count, question_count, caps_ratio) %>%
+  bind_cols(as.data.frame(sentiment_features_subset)) %>%
+  bind_cols(as.data.frame(unigram_matrix_subset)) %>%
+  bind_cols(as.data.frame(bigram_matrix_subset))
+
+# Clean column names
+names(feature_df) <- make.names(names(feature_df), unique = TRUE)
+names(feature_df) <- gsub("[^A-Za-z0-9_.]", "_", names(feature_df))
+feature_df[is.na(feature_df)] <- 0
+
+# Extended feature matrix with trigrams and character n-grams
+common_docs_extended <- intersect(intersect(common_docs, rownames(trigram_matrix)), 
+                                 rownames(char_ngram_matrix))
+
+extended_feature_df <- processed_reviews %>%
+  filter(as.character(doc_id) %in% common_docs_extended) %>%
+  arrange(match(as.character(doc_id), common_docs_extended)) %>%
+  dplyr::select(sentiment_class, sentiment_label, review_length, word_count, 
+                exclamation_count, question_count, caps_ratio) %>%
+  bind_cols(as.data.frame(sentiment_features[common_docs_extended, ])) %>%
+  bind_cols(as.data.frame(unigram_matrix[common_docs_extended, ])) %>%
+  bind_cols(as.data.frame(bigram_matrix[common_docs_extended, ])) %>%
+  bind_cols(as.data.frame(trigram_matrix[common_docs_extended, ])) %>%
+  bind_cols(as.data.frame(char_ngram_matrix[common_docs_extended, ]))
+
+names(extended_feature_df) <- make.names(names(extended_feature_df), unique = TRUE)
+names(extended_feature_df) <- gsub("[^A-Za-z0-9_.]", "_", names(extended_feature_df))
+extended_feature_df[is.na(extended_feature_df)] <- 0
+```
+
+# Association Rules Mining
+
+```{r association_rules}
+# Prepare binary data for association rules
+binary_threshold <- 0.01
+binary_features <- unigram_matrix_subset > binary_threshold
+binary_features <- binary_features[, colSums(binary_features) >= 10]
+
+sentiment_indicators <- data.frame(
+  sentiment_negative = processed_subset$sentiment_class == 0,
+  sentiment_neutral = processed_subset$sentiment_class == 1,
+  sentiment_positive = processed_subset$sentiment_class == 2
+)
+
+binary_data <- cbind(binary_features, sentiment_indicators)
+transactions_data <- as(binary_data, "transactions")
+
+# Mine association rules
+rules_negative <- if ("sentiment_negative" %in% itemLabels(transactions_data)) {
+  apriori(transactions_data, 
+          parameter = list(supp = 0.01, conf = 0.6, maxlen = 4),
+          appearance = list(rhs = "sentiment_negative"),
+          control = list(verbose = FALSE))
+} else NULL
+
+rules_positive <- if ("sentiment_positive" %in% itemLabels(transactions_data)) {
+  apriori(transactions_data,
+          parameter = list(supp = 0.01, conf = 0.6, maxlen = 4),
+          appearance = list(rhs = "sentiment_positive"),
+          control = list(verbose = FALSE))
+} else NULL
+
+# Display top rules
+if (!is.null(rules_negative) && length(rules_negative) > 0) {
+  cat("Table 3: Top Association Rules for Negative Sentiment\n")
+  inspect(head(sort(rules_negative, by = "confidence"), 5))
+}
+
+if (!is.null(rules_positive) && length(rules_positive) > 0) {
+  cat("Table 4: Top Association Rules for Positive Sentiment\n")
+  inspect(head(sort(rules_positive, by = "confidence"), 5))
+}
+```
+
+# Model Training
+
+```{r train_test_split}
+# Train-test split
+set.seed(2021)
+train_indices <- createDataPartition(feature_df$sentiment_class, p = 0.9, list = FALSE)
+
+train_data <- feature_df[train_indices, ]
+test_data <- feature_df[-train_indices, ]
+
+X_train <- train_data %>% dplyr::select(-sentiment_class, -sentiment_label) %>% as.matrix()
+y_train <- factor(train_data$sentiment_class)
+X_test <- test_data %>% dplyr::select(-sentiment_class, -sentiment_label) %>% as.matrix()
+y_test <- factor(test_data$sentiment_class)
+```
+
+# XGBoost Model
+
+```{r xgboost_model}
+# XGBoost training
+dtrain <- xgb.DMatrix(data = X_train, label = as.numeric(y_train) - 1)
+dtest <- xgb.DMatrix(data = X_test, label = as.numeric(y_test) - 1)
+
+xgb_params <- list(
+  objective = "multi:softprob",
+  num_class = 3,
+  eval_metric = "mlogloss",
+  eta = 0.05,
+  max_depth = 8,
+  min_child_weight = 1,
+  subsample = 0.8,
+  colsample_bytree = 0.8,
+  reg_alpha = 0.1,
+  reg_lambda = 1,
+  nthread = -1,
+  verbosity = 0
+)
+
+cv_result <- xgb.cv(
+  params = xgb_params,
+  data = dtrain,
+  nrounds = 200,
+  nfold = 5,
+  early_stopping_rounds = 20,
+  verbose = 0
+)
+
+xgb_model <- xgb.train(
+  params = xgb_params,
+  data = dtrain,
+  nrounds = cv_result$best_iteration,
+  watchlist = list(train = dtrain, test = dtest),
+  early_stopping_rounds = 20,
+  verbose = 0
+)
+
+xgb_pred_prob <- predict(xgb_model, dtest, reshape = TRUE)
+xgb_pred <- max.col(xgb_pred_prob) - 1
+xgb_accuracy <- mean(xgb_pred == as.numeric(y_test) - 1)
+
+cat(sprintf("XGBoost Accuracy: %.4f (%.2f%%)\n", xgb_accuracy, xgb_accuracy * 100))
+
+# Feature importance analysis
+xgb_importance <- xgb.importance(model = xgb_model)
+```
+```{r}
+# Figure 6: Feature Importance (XGBoost)
+if (exists("xgb_importance")) {
+  top_features_plot <- head(xgb_importance, 15)
+  
+  ggplot(top_features_plot, aes(x = reorder(Feature, Gain), y = Gain)) +
+    geom_col(fill = "steelblue", alpha = 0.8) +
+    coord_flip() +
+    labs(title = "Figure 6: Top 15 Feature Importance (XGBoost)",
+         x = "Features", y = "Importance (Gain)") +
+    theme_minimal() +
+    theme(plot.title = element_text(size = 12, face = "bold"),
+          axis.text.y = element_text(size = 9))
+}
+```
+
+
+# Random Forest Model
+
+```{r random_forest}
+rf_model <- ranger(
+  sentiment_class ~ . - sentiment_label,
+  data = train_data %>% mutate(sentiment_class = factor(sentiment_class)),
+  num.trees = 300,
+  mtry = floor(sqrt(ncol(X_train))),
+  importance = "impurity",
+  min.node.size = 5,
+  seed = 2021
+)
+
+test_data_factor <- test_data %>% mutate(sentiment_class = factor(sentiment_class))
+rf_pred <- predict(rf_model, data = test_data_factor)$predictions
+rf_accuracy <- mean(rf_pred == test_data_factor$sentiment_class)
+
+cat(sprintf("Random Forest Accuracy: %.4f (%.2f%%)\n", rf_accuracy, rf_accuracy * 100))
+```
+
+# Logistic Regression Model
+
+```{r logistic_regression}
+cv_glmnet <- cv.glmnet(
+  X_train, y_train,
+  family = "multinomial",
+  alpha = 0.5,
+  nfolds = 10,
+  type.measure = "class"
+)
+
+glmnet_model <- glmnet(
+  X_train, y_train,
+  family = "multinomial",
+  alpha = 0.5,
+  lambda = cv_glmnet$lambda.min
+)
+
+glmnet_pred_prob <- predict(glmnet_model, X_test, type = "response", s = cv_glmnet$lambda.min)
+glmnet_pred <- apply(glmnet_pred_prob, 1, which.max) - 1
+glmnet_accuracy <- mean(glmnet_pred == as.numeric(y_test) - 1)
+
+cat(sprintf("Logistic Regression Accuracy: %.4f (%.2f%%)\n", glmnet_accuracy, glmnet_accuracy * 100))
+```
+
+# Discriminant Analysis
+
+```{r discriminant_analysis}
+# Prepare extended data
+set.seed(2021)
+extended_train_indices <- createDataPartition(extended_feature_df$sentiment_class, p = 0.9, list = FALSE)
+
+extended_train_data <- extended_feature_df[extended_train_indices, ]
+extended_test_data <- extended_feature_df[-extended_train_indices, ]
+
+X_extended_train <- extended_train_data %>% dplyr::select(-sentiment_class, -sentiment_label) %>% as.matrix()
+y_extended_train <- factor(extended_train_data$sentiment_class)
+X_extended_test <- extended_test_data %>% dplyr::select(-sentiment_class, -sentiment_label) %>% as.matrix()
+y_extended_test <- factor(extended_test_data$sentiment_class)
+
+# Remove constant features
+feature_variance <- apply(X_extended_train, 2, var, na.rm = TRUE)
+constant_features <- which(feature_variance < 1e-8 | is.na(feature_variance))
+
+if (length(constant_features) > 0) {
+  X_extended_train <- X_extended_train[, -constant_features]
+  X_extended_test <- X_extended_test[, -constant_features]
+}
+
+# Scale features
+X_extended_train_scaled <- scale(X_extended_train)
+scaling_center <- attr(X_extended_train_scaled, "scaled:center")
+scaling_scale <- attr(X_extended_train_scaled, "scaled:scale")
+
+X_extended_test_scaled <- scale(X_extended_test, center = scaling_center, scale = scaling_scale)
+X_extended_train_scaled[!is.finite(X_extended_train_scaled)] <- 0
+X_extended_test_scaled[!is.finite(X_extended_test_scaled)] <- 0
+
+# Reduce features for stability
+max_features <- min(50, ncol(X_extended_train_scaled))
+feature_vars <- apply(X_extended_train_scaled, 2, var, na.rm = TRUE)
+top_features <- order(feature_vars, decreasing = TRUE)[1:max_features]
+
+X_train_reduced <- X_extended_train_scaled[, top_features]
+X_test_reduced <- X_extended_test_scaled[, top_features]
+
+# Linear Discriminant Analysis
+lda_train_df <- data.frame(sentiment_class = y_extended_train, X_train_reduced)
+lda_test_df <- data.frame(X_test_reduced)
+
+lda_success <- FALSE
+tryCatch({
+  lda_model <- lda(sentiment_class ~ ., data = lda_train_df)
+  lda_pred <- predict(lda_model, newdata = lda_test_df)
+  lda_accuracy <- mean(lda_pred$class == y_extended_test)
+  cat(sprintf("LDA Accuracy: %.4f (%.2f%%)\n", lda_accuracy, lda_accuracy * 100))
+  lda_success <- TRUE
+}, error = function(e) {
+  lda_accuracy <- 0
+  cat("LDA training failed\n")
+})
+
+# Regularized Discriminant Analysis
+rda_success <- FALSE
+tryCatch({
+  rda_train_df <- data.frame(sentiment_class = y_extended_train, X_train_reduced)
+  rda_test_df <- data.frame(X_test_reduced)
+  
+  rda_model <- rda(sentiment_class ~ ., data = rda_train_df, gamma = 0.5, lambda = 0.2)
+  rda_pred <- predict(rda_model, newdata = rda_test_df)
+  rda_accuracy <- mean(rda_pred$class == y_extended_test)
+  cat(sprintf("RDA Accuracy: %.4f (%.2f%%)\n", rda_accuracy, rda_accuracy * 100))
+  rda_success <- TRUE
+}, error = function(e) {
+  rda_accuracy <- 0
+  cat("RDA training failed\n")
+})
+```
+# Summary
+
+```{r summary}
+best_model <- all_models_results$Model[1]
+best_accuracy <- all_models_results$Accuracy[1]
+
+cat("Analysis Summary:\n")
+cat(sprintf("Best Model: %s\n", best_model))
+cat(sprintf("Best Accuracy: %.2f%%\n", best_accuracy * 100))
+cat(sprintf("Total Features: %d\n", ncol(extended_feature_df) - 2))
+cat(sprintf("Total Samples: %d\n", nrow(extended_feature_df)))
+
+# Feature breakdown
+feature_summary <- data.frame(
+  Feature_Type = c("Unigram TF-IDF", "Bigram TF-IDF", "Trigram TF-IDF", 
+                   "Character N-grams", "Sentiment Features", "Metadata Features"),
+  Count = c(ncol(unigram_matrix), ncol(bigram_matrix), ncol(trigram_matrix),
+            ncol(char_ngram_matrix), ncol(sentiment_features), 5),
+  Description = c("Single word frequency features", "Two-word phrase features",
+                  "Three-word phrase features", "Character-level patterns",  
+                  "Multi-lexicon sentiment scores", "Review length, punctuation, etc.")
+)
+
+cat("\nTable 7: Feature Engineering Summary\n")
+knitr::kable(feature_summary, 
+             caption = "Table 7: Comprehensive Feature Engineering Breakdown")
+
+cat("\nFeature Engineering Results:\n")
+cat(sprintf("- Unigram TF-IDF: %d features\n", ncol(unigram_matrix)))
+cat(sprintf("- Bigram TF-IDF: %d features\n", ncol(bigram_matrix)))
+cat(sprintf("- Trigram TF-IDF: %d features\n", ncol(trigram_matrix)))
+cat(sprintf("- Character N-grams: %d features\n", ncol(char_ngram_matrix)))
+cat(sprintf("- Sentiment features: %d features\n", ncol(sentiment_features)))
+
+discriminant_models <- all_models_results %>% filter(Model_Type == "Discriminant")
+if (nrow(discriminant_models) > 0) {
+  cat("\nTable 6: Discriminant Analysis Performance Summary\n")
+  knitr::kable(discriminant_models[, c("Model", "Accuracy_Percent", "Benchmark_Status")],
+               caption = "Table 6: Discriminant Analysis Models Performance",
+               col.names = c("Discriminant Model", "Accuracy (%)", "Benchmark Status"))
+  
+  for (i in 1:nrow(discriminant_models)) {
+    cat(sprintf("- %s: %.2f%%\n", discriminant_models$Model[i], discriminant_models$Accuracy_Percent[i]))
+  }
+}
+```
+
+# SVM Implementation
+
+```{r fast_svm_implementation}
+# Load libraries
+library(e1071)
+library(caret)
+library(MLmetrics)
+
+# Setting sample size
+SAMPLE_SIZE <- 10000
+USE_SAMPLING <- TRUE
+# REDUCE CROSS-VALIDATION FOLDS
+CV_FOLDS <- 3
+# SIMPLE HYPERPARAMETER GRIDS
+SIMPLE_GRID <- TRUE
+# FAST PREPROCESSING
+SCALE_DATA <- TRUE
+# Sample data
+if (USE_SAMPLING && length(y_train) > SAMPLE_SIZE) {
+  set.seed(2021)
+  train_indices_sample <- sample(length(y_train), SAMPLE_SIZE)
+  X_train_fast <- X_train[train_indices_sample, ]
+  y_train_fast <- y_train[train_indices_sample]
+  
+  cat(sprintf("Using %d samples out of %d (%.1f%%)\n", 
+              SAMPLE_SIZE, length(y_train), (SAMPLE_SIZE/length(y_train))*100))
+} else {
+  X_train_fast <- X_train
+  y_train_fast <- y_train
+  cat("Using full training dataset\n")
+}
+# Convert to factors
+y_train_factor <- factor(y_train_fast, levels = c("0", "1", "2"), labels = c("Negative", "Neutral", "Positive"))
+y_test_factor <- factor(y_test, levels = c("0", "1", "2"), labels = c("Negative", "Neutral", "Positive"))
+# Create training data
+train_data_svm <- data.frame(X_train_fast)
+train_data_svm$sentiment_class <- y_train_factor
+# Cross-validation control (reduced folds)
+ctrl <- trainControl(method = "cv", number = CV_FOLDS, 
+                    summaryFunction = multiClassSummary,
+                    classProbs = TRUE,
+                    verboseIter = FALSE)
+# Hyperparameter grids
+if (SIMPLE_GRID) {
+  # FAST GRIDS - much smaller search space
+  svm_grid_radial <- expand.grid(
+    sigma = c(0.01, 0.1),
+    C = c(1, 10)
+  )
+  svm_grid_linear <- expand.grid(C = c(0.1, 1, 10))
+} else {
+  # FULL GRIDS - more thorough but slower
+  svm_grid_radial <- expand.grid(
+    sigma = c(0.001, 0.01, 0.1),
+    C = c(0.1, 1, 10, 100)
+  )
+  
+  svm_grid_linear <- expand.grid(C = c(0.01, 0.1, 1, 10, 100))
+}
+
+cat(sprintf("RBF grid size: %d combinations\n", nrow(svm_grid_radial)))
+cat(sprintf("Linear grid size: %d combinations\n", nrow(svm_grid_linear)))
+
+# Train RBF SVM
+cat("Training RBF SVM:\n")
+start_time <- Sys.time()
+set.seed(2021)
+svm_radial_tuned <- train(
+  sentiment_class ~ ., 
+  data = train_data_svm,
+  method = "svmRadial",
+  trControl = ctrl,
+  tuneGrid = svm_grid_radial,
+  metric = "Accuracy",
+  preProcess = if(SCALE_DATA) c("center", "scale") else NULL
+)
+rbf_time <- Sys.time() - start_time
+cat(sprintf("RBF SVM completed in %.1f seconds\n", as.numeric(rbf_time)))
+# Train Linear SVM
+cat("Training Linear SVM...\n")
+start_time <- Sys.time()
+set.seed(2021)
+svm_linear_tuned <- train(
+  sentiment_class ~ ., 
+  data = train_data_svm,
+  method = "svmLinear",
+  trControl = ctrl,
+  tuneGrid = svm_grid_linear,
+  metric = "Accuracy",
+  preProcess = if(SCALE_DATA) c("center", "scale") else NULL
+)
+linear_time <- Sys.time() - start_time
+cat(sprintf("Linear SVM completed in %.1f seconds\n", as.numeric(linear_time)))
+
+# Make predictions
+test_data_svm <- data.frame(X_test)
+svm_radial_pred <- predict(svm_radial_tuned, newdata = test_data_svm)
+svm_linear_pred <- predict(svm_linear_tuned, newdata = test_data_svm)
+
+# Calculate accuracies
+svm_radial_accuracy <- mean(svm_radial_pred == y_test_factor)
+svm_linear_accuracy <- mean(svm_linear_pred == y_test_factor)
+
+# Confusion matrices and F1 scores
+svm_radial_cm <- confusionMatrix(svm_radial_pred, y_test_factor)
+svm_linear_cm <- confusionMatrix(svm_linear_pred, y_test_factor)
+
+calculate_macro_f1 <- function(confusion_matrix) {
+  precision <- diag(confusion_matrix) / rowSums(confusion_matrix)
+  recall <- diag(confusion_matrix) / colSums(confusion_matrix)
+  f1_scores <- 2 * (precision * recall) / (precision + recall)
+  f1_scores[is.nan(f1_scores)] <- 0
+  macro_f1 <- mean(f1_scores, na.rm = TRUE)
+  return(list(individual_f1 = f1_scores, macro_f1 = macro_f1))
+}
+
+svm_radial_f1 <- calculate_macro_f1(svm_radial_cm$table)
+svm_linear_f1 <- calculate_macro_f1(svm_linear_cm$table)
+
+# Results
+cat("\n", paste(rep("=", 50), collapse = ""), "\n")
+cat("SVM RESULTS SUMMARY\n")
+cat(paste(rep("=", 50), collapse = ""), "\n")
+cat(sprintf("Training time: RBF %.1fs, Linear %.1fs\n", rbf_time, linear_time))
+cat(sprintf("Sample used: %s\n", ifelse(USE_SAMPLING, paste(SAMPLE_SIZE, "samples"), "Full dataset")))
+cat("\nPerformance:\n")
+cat(sprintf("RBF SVM    - Accuracy: %.4f (%.2f%%), F1: %.4f\n", 
+            svm_radial_accuracy, svm_radial_accuracy * 100, svm_radial_f1$macro_f1))
+cat(sprintf("Linear SVM - Accuracy: %.4f (%.2f%%), F1: %.4f\n", 
+            svm_linear_accuracy, svm_linear_accuracy * 100, svm_linear_f1$macro_f1))
+
+cat("\nBest Hyperparameters:\n")
+cat(sprintf("RBF SVM: C=%.3f, Sigma=%.3f\n", svm_radial_tuned$bestTune$C, svm_radial_tuned$bestTune$sigma))
+cat(sprintf("Linear SVM: C=%.3f\n", svm_linear_tuned$bestTune$C))
+
+# Create SVM results
+svm_results_for_comparison <- data.frame(
+  Model = c("SVM (RBF - Tuned)", "SVM (Linear - Tuned)"),
+  Accuracy = c(svm_radial_accuracy, svm_linear_accuracy),
+  Model_Type = c("SVM", "SVM"),
+  Accuracy_Percent = c(round(svm_radial_accuracy * 100, 2), round(svm_linear_accuracy * 100, 2)),
+  Benchmark_Status = c(
+    ifelse(svm_radial_accuracy >= 0.65, "Target Achieved", "Below Target"),
+    ifelse(svm_linear_accuracy >= 0.65, "Target Achieved", "Below Target")
+  ),
+  stringsAsFactors = FALSE
+)
+# Now rbind will work perfectly
+all_models_results <- rbind(all_models_results, svm_results_for_comparison)
+
+# Re-sort by accuracy
+all_models_results <- all_models_results[order(-all_models_results$Accuracy), ]
+
+# Print results
+print(all_models_results)
+
+# Separate F1-score analysis (since it's not in the main table)
+cat("\nSVM F1-Score Analysis (separate from main results):\n")
+cat(sprintf("RBF SVM F1-Score: %.4f (%.2f%%)\n", svm_radial_f1$macro_f1, svm_radial_f1$macro_f1 * 100))
+cat(sprintf("Linear SVM F1-Score: %.4f (%.2f%%)\n", svm_linear_f1$macro_f1, svm_linear_f1$macro_f1 * 100))
+
+# Figure 5: Model Performance Visualization
+ggplot(all_models_results, aes(x = reorder(Model, Accuracy), y = Accuracy, fill = Model_Type)) +
+  geom_col(alpha = 0.8) +
+  geom_text(aes(label = paste0(Accuracy_Percent, "%")), 
+            hjust = -0.1, fontface = "bold", size = 3.5) +
+  coord_flip() +
+  ylim(0, 1) +
+  labs(title = "Figure 5: Model Performance Comparison",
+       subtitle = "Text Classification with Multiple Approaches",
+       x = "Model", y = "Accuracy", fill = "Model Type") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 12, face = "bold")) +
+  geom_hline(yintercept = 0.65, linetype = "dashed", color = "red", alpha = 0.65) +
+  ggplot2::annotate("text", x = 1, y = 0.75, label = "65% Target", color = "red", size = 3) +
+  scale_fill_brewer(palette = "Set2")
+```
+
+# Confusion Matrices and ROC Analysis
+
+```{r confusion_matrices_roc}
+library(caret)
+library(pROC)
+library(ggplot2)
+library(gridExtra)
+
+true_labels_factor <- factor(y_test, levels = c("0", "1", "2"), labels = c("Negative", "Neutral", "Positive"))
+
+model_predictions <- list(
+  "XGBoost" = factor(xgb_pred, levels = c(0, 1, 2), labels = c("Negative", "Neutral", "Positive")),
+  "Random Forest" = factor(rf_pred, levels = c("0", "1", "2"), labels = c("Negative", "Neutral", "Positive")),
+  "Logistic Regression" = factor(glmnet_pred, levels = c(0, 1, 2), labels = c("Negative", "Neutral", "Positive")),
+  "SVM (RBF)" = svm_radial_pred,
+  "SVM (Linear)" = svm_linear_pred
+)
+
+cat("Models in confusion matrix analysis:", names(model_predictions), "\n")
+
+create_confusion_plot <- function(pred, true, model_name) {
+  cm <- confusionMatrix(pred, true)
+  cm_df <- as.data.frame(cm$table)
+  names(cm_df) <- c("Predicted", "Actual", "Frequency")
+  cm_df$Percentage <- round(cm_df$Frequency / sum(cm_df$Frequency) * 100, 1)
+  
+  ggplot(cm_df, aes(x = Actual, y = Predicted, fill = Frequency)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = paste0(Frequency, "\n(", Percentage, "%)")), 
+              size = 3, color = "white", fontface = "bold") +
+    scale_fill_gradient(low = "lightblue", high = "darkblue") +
+    labs(title = paste("Confusion Matrix:", model_name),
+         subtitle = paste("Accuracy:", round(cm$overall['Accuracy'], 3))) +
+    theme_minimal() +
+    theme(plot.title = element_text(size = 10, face = "bold"),
+          axis.text.x = element_text(angle = 45, hjust = 1))
+}
+
+confusion_plots <- list()
+confusion_matrices <- list()
+
+for (model_name in names(model_predictions)) {
+  pred <- factor(model_predictions[[model_name]], levels = c("Negative", "Neutral", "Positive"))
+  cm <- confusionMatrix(pred, true_labels_factor)
+  confusion_matrices[[model_name]] <- cm
+  confusion_plots[[model_name]] <- create_confusion_plot(pred, true_labels_factor, model_name)
+}
+
+do.call(grid.arrange, c(confusion_plots[1:2], ncol = 2, top = "Figure 11a: Confusion Matrices (Part 1)"))
+do.call(grid.arrange, c(confusion_plots[3:5], ncol = 2, top = "Figure 11b: Confusion Matrices (Part 2)"))
+
+xgb_probs <- data.frame(xgb_pred_prob)
+names(xgb_probs) <- c("Negative", "Neutral", "Positive")
+
+svm_rbf_probs <- predict(svm_radial_tuned, newdata = data.frame(X_test), type = "prob")
+svm_linear_probs <- predict(svm_linear_tuned, newdata = data.frame(X_test), type = "prob")
+
+logit_probs <- data.frame(glmnet_pred_prob[,,1])
+names(logit_probs) <- c("Negative", "Neutral", "Positive")
+
+model_probabilities <- list(
+  "XGBoost" = xgb_probs,
+  "SVM (RBF)" = svm_rbf_probs,
+  "SVM (Linear)" = svm_linear_probs,
+  "Logistic Regression" = logit_probs
+)
+
+calculate_multiclass_roc <- function(true_labels, pred_probs) {
+  classes <- c("Negative", "Neutral", "Positive")
+  roc_results <- list()
+  auc_scores <- numeric()
+  
+  for (class in classes) {
+    binary_true <- ifelse(true_labels == class, 1, 0)
+    class_prob <- pred_probs[, class]
+    roc_obj <- roc(binary_true, class_prob, quiet = TRUE)
+    roc_results[[class]] <- roc_obj
+    auc_scores[class] <- auc(roc_obj)
+  }
+  
+  return(list(roc_curves = roc_results, auc_scores = auc_scores))
+}
+
+all_roc_data <- data.frame()
+
+for (model_name in names(model_probabilities)) {
+  probs <- model_probabilities[[model_name]]
+  
+  auc_scores <- numeric(3)
+  for (i in 1:3) {
+    class <- c("Negative", "Neutral", "Positive")[i]
+    binary_true <- ifelse(true_labels_factor == class, 1, 0)
+    class_probs <- probs[, class]
+    
+    roc_obj <- roc(binary_true, class_probs, quiet = TRUE)
+    auc_scores[i] <- auc(roc_obj)
+  }
+  
+  positive_class_probs <- probs[, "Positive"]
+  positive_binary <- ifelse(true_labels_factor == "Positive", 1, 0)
+  roc_obj <- roc(positive_binary, positive_class_probs, quiet = TRUE)
+  mean_auc <- mean(auc_scores)
+  
+  temp_df <- data.frame(
+    FPR = 1 - roc_obj$specificities,
+    TPR = roc_obj$sensitivities,
+    Model = paste0(model_name, " (AUC: ", round(mean_auc, 3), ")")
+  )
+  all_roc_data <- rbind(all_roc_data, temp_df)
+}
+
+all_roc_data$Model_Clean <- all_roc_data$Model
+
+combined_roc_plot <- ggplot(all_roc_data, aes(x = FPR, y = TPR, color = Model_Clean)) +
+  geom_line(size = 1) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray") +
+  labs(title = "ROC Curves: All Models (Positive Class)",
+       x = "False Positive Rate", y = "True Positive Rate") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 12, face = "bold"),
+        legend.position = "right") +
+  guides(color = guide_legend(title = "Model (Mean AUC)"))
+
+print(combined_roc_plot)
+
+performance_summary <- data.frame()
+
+for (model_name in names(model_predictions)) {
+  pred <- factor(model_predictions[[model_name]], levels = c("Negative", "Neutral", "Positive"))
+  cm <- confusion_matrices[[model_name]]
+  
+  accuracy <- cm$overall['Accuracy']
+  precision <- cm$byClass[, 'Precision']
+  recall <- cm$byClass[, 'Recall']
+  f1 <- cm$byClass[, 'F1']
+  
+  macro_precision <- mean(precision, na.rm = TRUE)
+  macro_recall <- mean(recall, na.rm = TRUE)
+  macro_f1 <- mean(f1, na.rm = TRUE)
+  
+  mean_auc <- NA
+  if (model_name %in% names(model_probabilities)) {
+    probs <- model_probabilities[[model_name]]
+    auc_scores <- numeric(3)
+    
+    for (i in 1:3) {
+      class <- c("Negative", "Neutral", "Positive")[i]
+      binary_true <- ifelse(true_labels_factor == class, 1, 0)
+      class_probs <- probs[, class]
+      roc_obj <- roc(binary_true, class_probs, quiet = TRUE)
+      auc_scores[i] <- auc(roc_obj)
+    }
+    mean_auc <- mean(auc_scores)
+  }
+  
+  performance_summary <- rbind(performance_summary, data.frame(
+    Model = model_name,
+    Accuracy = round(accuracy, 4),
+    Macro_Precision = round(macro_precision, 4),
+    Macro_Recall = round(macro_recall, 4),
+    Macro_F1 = round(macro_f1, 4),
+    Mean_AUC = ifelse(is.na(mean_auc), "N/A", round(mean_auc, 4))
+  ))
+  
+  cat(sprintf("Processed %s: Accuracy = %.4f\n", model_name, accuracy))
+}
+
+performance_summary <- performance_summary[order(-performance_summary$Accuracy), ]
+
+knitr::kable(performance_summary, 
+             caption = "Table 14: Model Performance Metrics",
+             col.names = c("Model", "Accuracy", "Macro Precision", "Macro Recall", "Macro F1", "Mean AUC"))
+
+print(performance_summary)
+```
+
+# CLUSTERING DATA PREPARATION
+
+```{r clustering_preparation}
+# CLUSTERING DATA PREPARATION - Using feature_df from previous assignments
+# Manual sample size setting (adjust as needed)
+MANUAL_SAMPLE_SIZE <- 5000  # Change this value to adjust sample size
+
+# Check if feature_df exists from previous assignments
+if (!exists("feature_df")) {
+  stop("feature_df not found. Please run the previous feature engineering code first.")
+}
+
+# Clear any old variables to avoid conflicts
+if (exists("pca_coords")) rm(pca_coords)
+if (exists("pca_result")) rm(pca_result)
+
+# Sample data if needed (for computational efficiency)
+set.seed(2021)
+if (nrow(feature_df) > MANUAL_SAMPLE_SIZE) {
+  sample_indices <- sample(nrow(feature_df), MANUAL_SAMPLE_SIZE)
+  reviews_final <- feature_df[sample_indices, ]
+} else {
+  reviews_final <- feature_df
+}
+
+# Extract clustering features (remove target variables)
+clustering_features <- reviews_final %>%
+  dplyr::select(-sentiment_class, -sentiment_label)
+
+# Convert to matrix and clean
+clustering_features_matrix <- as.matrix(clustering_features)
+clustering_features_matrix[!is.finite(clustering_features_matrix)] <- 0
+
+# Remove rows with all zeros
+valid_rows <- rowSums(abs(clustering_features_matrix)) > 0
+clustering_features_matrix <- clustering_features_matrix[valid_rows, ]
+reviews_final <- reviews_final[valid_rows, ]
+
+# Scale features for clustering
+clustering_features_scaled <- scale(clustering_features_matrix, center = TRUE, scale = TRUE)
+clustering_features_scaled[!is.finite(clustering_features_scaled)] <- 0
+
+# Create PCA for visualization - USING THE NEW DATA
+cat("Creating PCA from current dataset...\n")
+pca_result <- PCA(clustering_features_scaled, graph = FALSE, ncp = 10)
+pca_coords <- pca_result$ind$coord[, 1:2]
+
+# Store true labels for evaluation
+true_labels <- reviews_final$sentiment_class
+
+# Verify dimensions match
+cat("Dimension verification:")
+cat(paste("\n- clustering_features_scaled:", nrow(clustering_features_scaled), "x", ncol(clustering_features_scaled)))
+cat(paste("\n- pca_coords:", nrow(pca_coords), "x", ncol(pca_coords)))
+cat(paste("\n- true_labels:", length(true_labels)))
+
+# Create feature subsets for specialized analysis
+available_columns <- names(reviews_final)
+
+# TF-IDF features
+tfidf_columns <- available_columns[!grepl("^(sentiment_|bing_|afinn_|nrc_|review_length|word_count|exclamation_count|question_count|caps_ratio)", available_columns)]
+tfidf_columns <- tfidf_columns[!tfidf_columns %in% c("sentiment_class", "sentiment_label")]
+
+if (length(tfidf_columns) > 0) {
+  tfidf_features <- reviews_final %>%
+    dplyr::select(all_of(tfidf_columns)) %>%
+    scale()
+  tfidf_features[!is.finite(tfidf_features)] <- 0
+} else {
+  tfidf_features <- matrix(0, nrow = nrow(reviews_final), ncol = 1)
+  colnames(tfidf_features) <- "dummy_tfidf"
+}
+
+# Sentiment features
+sentiment_columns <- available_columns[grepl("^(bing_|afinn_|nrc_)", available_columns)]
+if (length(sentiment_columns) > 0) {
+  sentiment_only_features <- reviews_final %>%
+    dplyr::select(all_of(sentiment_columns)) %>%
+    scale()
+  sentiment_only_features[!is.finite(sentiment_only_features)] <- 0
+} else {
+  sentiment_only_features <- matrix(0, nrow = nrow(reviews_final), ncol = 1)
+  colnames(sentiment_only_features) <- "dummy_sentiment"
+}
+
+# Original unscaled version
+sentence_embeddings <- clustering_features_matrix
+
+# Normalized version for cosine similarity
+sentence_embeddings_norm <- sentence_embeddings / (sqrt(rowSums(sentence_embeddings^2)) + 1e-10)
+
+cat("\n\nClustering Data Preparation Complete:")
+cat(paste("\n- Total samples:", nrow(clustering_features_scaled)))
+cat(paste("\n- Feature dimensions:", ncol(clustering_features_scaled)))
+cat(paste("\n- Data source: feature_df from previous assignments"))
+cat(paste("\n- Manual sample size setting:", MANUAL_SAMPLE_SIZE))
+cat(paste("\n- Actual sample size used:", nrow(reviews_final)))
+
+```
+
+
+# Distance Metrics Analysis
+
+```{r distance_metrics_analysis}
+set.seed(2021)
+sample_indices <- sample(nrow(clustering_features_scaled), min(2000, nrow(clustering_features_scaled)))
+sample_data <- clustering_features_scaled[sample_indices, ]
+
+distances <- list()
+distances$euclidean <- dist(sample_data, method = "euclidean")
+distances$manhattan <- dist(sample_data, method = "manhattan")
+distances$minkowski <- dist(sample_data, method = "minkowski", p = 3)
+
+# Cosine distance
+distances$cosine <- proxy::dist(sample_data, method = "cosine")
+
+# Distance statistics
+distance_stats <- data.frame(
+  Distance_Metric = c("Euclidean", "Manhattan", "Minkowski", "Cosine"),
+  Min_Distance = c(min(distances$euclidean), min(distances$manhattan), 
+                   min(distances$minkowski), min(distances$cosine)),
+  Max_Distance = c(max(distances$euclidean), max(distances$manhattan),
+                   max(distances$minkowski), max(distances$cosine)),
+  Mean_Distance = c(mean(distances$euclidean), mean(distances$manhattan),
+                    mean(distances$minkowski), mean(distances$cosine))
+)
+
+knitr::kable(distance_stats, caption = "Table 8: Distance Metrics Comparison", digits = 4)
+```
+
+```{r}
+par(mfrow = c(2,2))
+hist(as.vector(distances$euclidean), main = "Euclidean", xlab = "Distance")
+hist(as.vector(distances$manhattan), main = "Manhattan", xlab = "Distance")
+hist(as.vector(distances$minkowski), main = "Minkowski", xlab = "Distance")
+hist(as.vector(distances$cosine), main = "Cosine", xlab = "Distance")
+par(mfrow = c(1,1))
+
+```
+
+
+# K-Means Clustering Analysis
+
+```{r kmeans_clustering}
+# Function to perform k-means with different distance metrics
+perform_kmeans_analysis <- function(data, k_range = 2:8, distance_metric = "euclidean") {
+  results <- list()
+  for (k in k_range) {
+    set.seed(2021)
+    if (distance_metric == "euclidean") {
+      kmeans_result <- kmeans(data, centers = k, nstart = 25, iter.max = 100)
+    } else {
+      # For non-Euclidean metrics, use k-medoids
+      tryCatch({
+        if (distance_metric == "manhattan") {
+          dist_matrix <- dist(data, method = "manhattan")
+        } else if (distance_metric == "cosine") {
+          if (requireNamespace("proxy", quietly = TRUE)) {
+            dist_matrix <- proxy::dist(data, method = "cosine")
+          } else {
+            dist_matrix <- calculate_cosine_distance(data)
+          }
+        } else {
+          dist_matrix <- dist(data, method = "minkowski", p = 3)
+        }
+        
+        pam_result <- pam(dist_matrix, k = k)
+        # Convert PAM result to kmeans-like structure
+        kmeans_result <- list(
+          cluster = pam_result$clustering,
+          centers = data[pam_result$medoids, ],
+          withinss = pam_result$objective,
+          tot.withinss = sum(pam_result$objective),
+          size = table(pam_result$clustering)
+        )
+      }, error = function(e) {
+        cat(sprintf("Error with %s distance for k=%d: %s\n", distance_metric, k, e$message))
+        # Fallback to euclidean k-means
+        kmeans_result <- kmeans(data, centers = k, nstart = 25, iter.max = 100)
+      })
+    }
+    
+    results[[paste0("k", k)]] <- kmeans_result
+  }
+  
+  return(results)
+}
+
+# K-means with different distance metrics
+kmeans_euclidean <- perform_kmeans_analysis(clustering_features_scaled, distance_metric = "euclidean")
+kmeans_cosine <- perform_kmeans_analysis(clustering_features_scaled, distance_metric = "cosine")
+
+# Optimal k selection using elbow method and silhouette analysis
+set.seed(2021)
+k_range <- 2:8
+
+# Elbow method for Euclidean
+wss_euclidean <- sapply(k_range, function(k) {
+  kmeans(clustering_features_scaled, centers = k, nstart = 25)$tot.withinss
+})
+
+# Silhouette analysis for Euclidean
+silhouette_euclidean <- sapply(k_range, function(k) {
+  km <- kmeans(clustering_features_scaled, centers = k, nstart = 25)
+  sil <- silhouette(km$cluster, dist(clustering_features_scaled))
+  mean(sil[, 3])
+})
+
+# Table 9: K-means Optimization Results
+kmeans_optimization <- data.frame(
+  K = k_range,
+  WSS_Euclidean = wss_euclidean,
+  Silhouette_Euclidean = silhouette_euclidean,
+  WSS_Normalized = wss_euclidean / max(wss_euclidean),
+  Silhouette_Score = round(silhouette_euclidean, 4)
+)
+
+knitr::kable(kmeans_optimization,
+             caption = "Table 9: K-means Clustering Optimization Metrics",
+             digits = 4)
+
+# Select optimal k (highest silhouette score)
+optimal_k <- k_range[which.max(silhouette_euclidean)]
+cat("\nDATA STRUCTURE ANALYSIS:\n")
+cat(sprintf("Dataset Size: %d documents\n", nrow(clustering_features_scaled)))
+cat(sprintf("Feature Dimensions: %d features\n", ncol(clustering_features_scaled)))
+cat(sprintf("- TF-IDF Features: %d (%.1f%%)\n", ncol(tfidf_features), 
+            ncol(tfidf_features)/ncol(clustering_features_scaled)*100))
+cat(sprintf("- Sentiment Features: %d (%.1f%%)\n", ncol(sentiment_only_features),
+            ncol(sentiment_only_features)/ncol(clustering_features_scaled)*100))
+cat(sprintf("- Metadata Features: 5 (2.3%%)\n"))
+
+# Final k-means models with optimal k
+set.seed(2021)
+final_kmeans_euclidean <- kmeans(clustering_features_scaled, centers = optimal_k, nstart = 25)
+
+# For cosine distance, use PAM (k-medoids) since true k-means doesn't support cosine
+tryCatch({
+  if (requireNamespace("proxy", quietly = TRUE)) {
+    cosine_dist_matrix <- proxy::dist(clustering_features_scaled, method = "cosine")
+  } else {
+    cosine_dist_matrix <- calculate_cosine_distance(clustering_features_scaled)
+  }
+  
+  pam_cosine <- pam(cosine_dist_matrix, k = optimal_k)
+  final_kmeans_cosine <- list(
+    cluster = pam_cosine$clustering,
+    centers = clustering_features_scaled[pam_cosine$medoids, ],
+    size = table(pam_cosine$clustering)
+  )
+  
+  cat(sprintf("K-means (Euclidean): %d clusters\n", length(unique(final_kmeans_euclidean$cluster))))
+  cat(sprintf("PAM (Cosine): %d clusters\n", length(unique(final_kmeans_cosine$cluster))))
+  
+}, error = function(e) {
+  cat("Cosine distance clustering failed, using Euclidean results as fallback\n")
+  final_kmeans_cosine <- final_kmeans_euclidean
+})
+```
+
+```{r kmeans_visualization, fig.cap="Figure 7: K-means Clustering Results"}
+# Figure 7: K-means Clustering Visualization
+# Fix dimension mismatch by ensuring all objects have same number of rows
+n_samples <- min(
+  nrow(pca_coords),
+  length(final_kmeans_euclidean$cluster),
+  length(final_kmeans_cosine$cluster),
+  length(true_labels)
+)
+
+# Subset all objects to have the same number of rows
+pca_coords_subset <- pca_coords[1:n_samples, ]
+euclidean_clusters_subset <- final_kmeans_euclidean$cluster[1:n_samples]
+cosine_clusters_subset <- final_kmeans_cosine$cluster[1:n_samples]
+true_labels_subset <- true_labels[1:n_samples]
+
+kmeans_plot_data <- data.frame(
+  PC1 = pca_coords_subset[, 1],
+  PC2 = pca_coords_subset[, 2],
+  Cluster_Euclidean = factor(euclidean_clusters_subset),
+  Cluster_Cosine = factor(cosine_clusters_subset),
+  True_Sentiment = factor(true_labels_subset, labels = c("Negative", "Neutral", "Positive"))
+)
+
+library(gridExtra)
+
+p1 <- ggplot(kmeans_plot_data, aes(x = PC1, y = PC2, color = Cluster_Euclidean)) +
+  geom_point(alpha = 0.6, size = 1.2) +
+  labs(title = "K-means (Euclidean Distance)",
+       x = "First Principal Component", y = "Second Principal Component") +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  scale_color_brewer(palette = "Set1", name = "Cluster")
+
+p2 <- ggplot(kmeans_plot_data, aes(x = PC1, y = PC2, color = True_Sentiment)) +
+  geom_point(alpha = 0.6, size = 1.2) +
+  labs(title = "True Sentiment Labels",
+       x = "First Principal Component", y = "Second Principal Component") +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  scale_color_brewer(palette = "Set2", name = "Sentiment")
+
+grid.arrange(p1, p2, ncol = 2, 
+             top = "Figure 7: K-means Clustering vs True Labels")
+```
+# Fixed Clean DBSCAN Implementation
+
+```{r dbscan_clustering_fixed}
+library(dbscan)
+# Euclidean: Increase eps to merge micro-clusters
+EUCLIDEAN_EPS <- 13.0
+EUCLIDEAN_MINPTS <- 5
+
+# Manhattan: Decrease eps to get multiple clusters  
+MANHATTAN_EPS <- 18.0
+MANHATTAN_MINPTS <- 3
+
+# Larger sample size for better representation
+SAMPLE_SIZE <- 8000
+
+cat("DBSCAN Parameters (Fixed):\n")
+cat(sprintf("Euclidean: eps=%.1f, minPts=%d\n", EUCLIDEAN_EPS, EUCLIDEAN_MINPTS))
+cat(sprintf("Manhattan: eps=%.1f, minPts=%d\n", MANHATTAN_EPS, MANHATTAN_MINPTS))
+cat(sprintf("Sample size: %d\n", SAMPLE_SIZE))
+
+# EUCLIDEAN DBSCAN
+set.seed(2021)
+dbscan_euclidean <- dbscan::dbscan(clustering_features_scaled, 
+                                   eps = EUCLIDEAN_EPS, 
+                                   minPts = EUCLIDEAN_MINPTS)
+
+euclidean_clusters <- length(unique(dbscan_euclidean$cluster[dbscan_euclidean$cluster != 0]))
+euclidean_noise <- sum(dbscan_euclidean$cluster == 0)
+euclidean_total <- length(dbscan_euclidean$cluster)
+euclidean_cluster_table <- table(dbscan_euclidean$cluster)
+
+cat("\nEuclidean DBSCAN Results:\n")
+print(euclidean_cluster_table)
+cat(sprintf("Summary: %d clusters, %d noise points (%.1f%%)\n", 
+            euclidean_clusters, euclidean_noise, (euclidean_noise/euclidean_total)*100))
+
+# MANHATTAN DBSCAN
+set.seed(2021)
+sample_size <- min(SAMPLE_SIZE, nrow(clustering_features_scaled))
+sample_indices <- sample(nrow(clustering_features_scaled), sample_size)
+sample_data <- clustering_features_scaled[sample_indices, ]
+
+dbscan_manhattan_sample <- dbscan::dbscan(sample_data, 
+                                         eps = MANHATTAN_EPS, 
+                                         minPts = MANHATTAN_MINPTS)
+
+# Extend to full dataset
+full_clusters_manhattan <- rep(0, nrow(clustering_features_scaled))
+full_clusters_manhattan[sample_indices] <- dbscan_manhattan_sample$cluster
+
+# Assign remaining points
+remaining_indices <- setdiff(1:nrow(clustering_features_scaled), sample_indices)
+
+for (i in remaining_indices) {
+  distances <- apply(sample_data, 1, function(x) {
+    sum(abs(clustering_features_scaled[i, ] - x))
+  })
+  
+  min_distance <- min(distances)
+  if (min_distance <= MANHATTAN_EPS) {
+    nearest_idx <- which.min(distances)
+    full_clusters_manhattan[i] <- dbscan_manhattan_sample$cluster[nearest_idx]
+  }
+}
+
+dbscan_manhattan <- list(cluster = full_clusters_manhattan)
+
+manhattan_clusters <- length(unique(dbscan_manhattan$cluster[dbscan_manhattan$cluster != 0]))
+manhattan_noise <- sum(dbscan_manhattan$cluster == 0)
+manhattan_total <- length(dbscan_manhattan$cluster)
+manhattan_cluster_table <- table(dbscan_manhattan$cluster)
+
+cat("\nManhattan DBSCAN Results:\n")
+print(manhattan_cluster_table)
+cat(sprintf("Summary: %d clusters, %d noise points (%.1f%%)\n", 
+            manhattan_clusters, manhattan_noise, (manhattan_noise/manhattan_total)*100))
+
+# SUMMARY TABLE
+dbscan_summary <- data.frame(
+  Distance_Metric = c("Euclidean", "Manhattan"),
+  Eps = c(EUCLIDEAN_EPS, MANHATTAN_EPS),
+  MinPts = c(EUCLIDEAN_MINPTS, MANHATTAN_MINPTS),
+  Num_Clusters = c(euclidean_clusters, manhattan_clusters),
+  Noise_Points = c(euclidean_noise, manhattan_noise),
+  Total_Points = c(euclidean_total, manhattan_total),
+  Noise_Ratio = c(
+    round(euclidean_noise / euclidean_total, 3),
+    round(manhattan_noise / manhattan_total, 3)
+  )
+)
+
+knitr::kable(dbscan_summary, caption = "Table 11: DBSCAN Clustering Results Summary")
+
+cat("\nDBSCAN clustering completed\n")
+```
+
+# DBSCAN Clustering Analysis
+
+```{r dbscan_clustering}
+# Function to find optimal DBSCAN parameters
+find_optimal_dbscan_params <- function(data, sample_size = 1000) {
+  set.seed(2021)
+  sample_indices <- sample(nrow(data), min(sample_size, nrow(data)))
+  sample_data <- data[sample_indices, ]
+  
+  # k-distance plot for eps selection
+  kNNdistplot(sample_data, k = 4)
+  abline(h = 15.0, lty = 2, col = "red")
+  
+  eps_range <- seq(5, 25, by = 2.5)
+  minpts_range <- c(5, 10, 15, 20)
+  
+  dbscan_results <- data.frame(
+    eps = numeric(0),
+    minPts = numeric(0),
+    n_clusters = numeric(0),
+    noise_ratio = numeric(0),
+    valid_clusters = logical(0)
+  )
+  cat(sprintf("eps range: %.1f to %.1f\n", min(eps_range), max(eps_range)))
+  cat(sprintf("minPts range: %d to %d\n", min(minpts_range), max(minpts_range)))
+  
+  for (eps in eps_range) {
+    for (minpts in minpts_range) {
+      tryCatch({
+        db_result <- dbscan::dbscan(sample_data, eps = eps, minPts = minpts)
+        n_clusters <- length(unique(db_result$cluster[db_result$cluster != 0]))
+        noise_ratio <- sum(db_result$cluster == 0) / length(db_result$cluster)
+        is_valid <- (n_clusters > 1) && (n_clusters < 8) && (noise_ratio < 0.3) 
+        
+        dbscan_results <- rbind(dbscan_results, data.frame(
+          eps = eps,
+          minPts = minpts,
+          n_clusters = n_clusters,
+          noise_ratio = noise_ratio,
+          valid_clusters = is_valid
+        ))
+        
+        
+      }, error = function(e) {
+        cat(sprintf("DBSCAN failed for eps=%.1f, minPts=%d: %s\n", eps, minpts, e$message))
+      })
+    }
+  }
+  return(list(results = dbscan_results, sample_indices = sample_indices, sample_data = sample_data))
+}
+
+# Find optimal DBSCAN parameters
+dbscan_optimization <- find_optimal_dbscan_params(clustering_features_scaled)
+
+# Select optimal parameters (reasonable number of clusters, low noise)
+valid_params <- dbscan_optimization$results[
+  dbscan_optimization$results$valid_clusters == TRUE &
+  dbscan_optimization$results$n_clusters >= 2 & 
+  dbscan_optimization$results$n_clusters <= 6, 
+]
+
+if (nrow(valid_params) > 0) {
+  valid_params <- valid_params[order(-valid_params$n_clusters, valid_params$noise_ratio), ]
+  optimal_params <- valid_params[1, ]
+} else {
+  optimal_params <- data.frame()
+}
+set.seed(2021)
+
+# DBSCAN with Euclidean distance (default)
+tryCatch({
+
+  dbscan_euclidean <- dbscan::dbscan(clustering_features_scaled, 
+                                      eps = optimal_eps, 
+                                      minPts = optimal_minpts)
+  cat(sprintf("DBSCAN completed: %d clusters, %d noise points\n", 
+                length(unique(dbscan_euclidean$cluster[dbscan_euclidean$cluster != 0])),
+                sum(dbscan_euclidean$cluster == 0)))
+}, error = function(e) {
+  cat(sprintf("DBSCAN with optimal parameters failed: %s\n", e$message))
+})
+
+# DBSCAN with Manhattan distance (note: not directly supported, using workaround)
+tryCatch({
+  # Create a custom distance matrix approach for Manhattan
+  sample_indices_manhattan <- sample(nrow(clustering_features_scaled), 
+                                   min(2000, nrow(clustering_features_scaled)))
+  sample_data_manhattan <- clustering_features_scaled[sample_indices_manhattan, ]
+  
+  # Use larger eps for Manhattan distance (mean=84.2 vs Euclidean mean=19.8)
+  manhattan_eps <- optimal_eps * 4.5  # Scale based on distance ratio
+  
+  if (requireNamespace("dbscan", quietly = TRUE)) {
+    dbscan_manhattan_sample <- dbscan::dbscan(sample_data_manhattan, 
+                                             eps = manhattan_eps, 
+                                             minPts = optimal_minpts)
+  } else if (requireNamespace("fpc", quietly = TRUE)) {
+    dbscan_manhattan_sample <- fpc::dbscan(sample_data_manhattan, 
+                                          eps = manhattan_eps, 
+                                          MinPts = optimal_minpts)
+  } else {
+    stop("No dbscan implementation available")
+  }
+  
+  # Extend results to full dataset (assign remaining points to nearest cluster)
+  full_clusters_manhattan <- rep(0, nrow(clustering_features_scaled))
+  full_clusters_manhattan[sample_indices_manhattan] <- dbscan_manhattan_sample$cluster
+  
+  # For non-sampled points, assign based on nearest sampled point
+  if (length(sample_indices_manhattan) < nrow(clustering_features_scaled)) {
+    remaining_indices <- setdiff(1:nrow(clustering_features_scaled), sample_indices_manhattan)
+    cat(sprintf("Assigning %d remaining points to nearest clusters...\n", length(remaining_indices)))
+    
+    for (i in remaining_indices) {
+      distances <- apply(sample_data_manhattan, 1, function(x) {
+        sum(abs(clustering_features_scaled[i, ] - x))
+      })
+      nearest_idx <- which.min(distances)
+      full_clusters_manhattan[i] <- dbscan_manhattan_sample$cluster[nearest_idx]
+    }
+  }
+  
+  # Create a dbscan-like result object
+  dbscan_manhattan <- list(cluster = full_clusters_manhattan)
+  
+  cat(sprintf("DBSCAN Manhattan completed: %d clusters, %d noise points (eps=%.1f)\n", 
+              length(unique(dbscan_manhattan$cluster[dbscan_manhattan$cluster != 0])),
+              sum(dbscan_manhattan$cluster == 0),
+              manhattan_eps))
+  
+}, error = function(e) {
+  cat("DBSCAN with Manhattan distance failed, using Euclidean results\n")
+  dbscan_manhattan <- dbscan_euclidean
+})
+
+optimal_eps <- 15.0
+optimal_minpts <- 10
+
+# Table 11: DBSCAN Results Summary
+dbscan_summary <- data.frame(
+  Distance_Metric = c("Euclidean", "Manhattan"),
+  Eps = c(optimal_eps, optimal_eps * 4.5),  # Show actual eps values used
+  MinPts = c(optimal_minpts, optimal_minpts),
+  Num_Clusters = c(
+    length(unique(dbscan_euclidean$cluster[dbscan_euclidean$cluster != 0])),
+    length(unique(dbscan_manhattan$cluster[dbscan_manhattan$cluster != 0]))
+  ),
+  Noise_Points = c(
+    sum(dbscan_euclidean$cluster == 0),
+    sum(dbscan_manhattan$cluster == 0)
+  ),
+  Noise_Ratio = c(
+    round(sum(dbscan_euclidean$cluster == 0) / length(dbscan_euclidean$cluster), 3),
+    round(sum(dbscan_manhattan$cluster == 0) / length(dbscan_manhattan$cluster), 3)
+  )
+)
+
+knitr::kable(dbscan_summary,
+             caption = "Table 11: DBSCAN Clustering Results Summary")
+
+# Analysis of DBSCAN results
+cat("\nDBSCAN Analysis Insights:\n")
+cat(paste(rep("=", 30), collapse = ""), "\n")
+
+euclidean_clusters <- length(unique(dbscan_euclidean$cluster[dbscan_euclidean$cluster != 0]))
+manhattan_clusters <- length(unique(dbscan_manhattan$cluster[dbscan_manhattan$cluster != 0]))
+euclidean_noise_ratio <- sum(dbscan_euclidean$cluster == 0) / length(dbscan_euclidean$cluster)
+manhattan_noise_ratio <- sum(dbscan_manhattan$cluster == 0) / length(dbscan_manhattan$cluster)
+
+cat(sprintf("Euclidean DBSCAN (eps=%.1f):\n", optimal_eps))
+cat(sprintf("  • %d clusters found\n", euclidean_clusters))
+cat(sprintf("  • %.1f%% noise points\n", euclidean_noise_ratio * 100))
+
+cat(sprintf("\nManhattan DBSCAN (eps=%.1f):\n", optimal_eps * 4.5))
+cat(sprintf("  • %d clusters found\n", manhattan_clusters))
+cat(sprintf("  • %.1f%% noise points\n", manhattan_noise_ratio * 100))
+
+cat("\n")
+```
+
+
+```{r dbscan_visualization, fig.cap="Figure 9: DBSCAN Clustering Results"}
+# Figure 9: DBSCAN Clustering Visualization (FIXED)
+# Ensure all objects have consistent dimensions
+n_samples <- min(
+  nrow(pca_coords),
+  length(dbscan_euclidean$cluster),
+  length(dbscan_manhattan$cluster),
+  length(true_labels)
+)
+
+# Subset all objects to same size
+pca_coords_subset <- pca_coords[1:n_samples, ]
+euclidean_clusters_subset <- dbscan_euclidean$cluster[1:n_samples]
+manhattan_clusters_subset <- dbscan_manhattan$cluster[1:n_samples]
+true_labels_subset <- true_labels[1:n_samples]
+
+# Create proper factor labels for DBSCAN
+dbscan_plot_data <- data.frame(
+  PC1 = pca_coords_subset[, 1],
+  PC2 = pca_coords_subset[, 2],
+  True_Sentiment = factor(true_labels_subset, labels = c("Negative", "Neutral", "Positive"))
+)
+
+# Handle Euclidean DBSCAN clusters
+euclidean_labels_factor <- factor(euclidean_clusters_subset, 
+                                 levels = sort(unique(euclidean_clusters_subset)),
+                                 labels = ifelse(sort(unique(euclidean_clusters_subset)) == 0, 
+                                               "Noise", 
+                                               paste("Cluster", sort(unique(euclidean_clusters_subset))[sort(unique(euclidean_clusters_subset)) != 0])))
+
+dbscan_plot_data$DBSCAN_Euclidean <- euclidean_labels_factor
+
+# Handle Manhattan DBSCAN clusters  
+manhattan_labels_factor <- factor(manhattan_clusters_subset,
+                                 levels = sort(unique(manhattan_clusters_subset)),
+                                 labels = ifelse(sort(unique(manhattan_clusters_subset)) == 0,
+                                               "Noise",
+                                               paste("Cluster", sort(unique(manhattan_clusters_subset))[sort(unique(manhattan_clusters_subset)) != 0])))
+
+dbscan_plot_data$DBSCAN_Manhattan <- manhattan_labels_factor
+
+# Create plots
+p1 <- ggplot(dbscan_plot_data, aes(x = PC1, y = PC2, color = DBSCAN_Euclidean)) +
+  geom_point(alpha = 0.7, size = 1.5) +
+  labs(title = "DBSCAN (Euclidean Distance)",
+       subtitle = paste("eps=", round(optimal_eps, 2), ", Found", 
+                       length(unique(euclidean_clusters_subset[euclidean_clusters_subset != 0])), 
+                       "clusters +", sum(euclidean_clusters_subset == 0), "noise points"),
+       x = "First Principal Component", y = "Second Principal Component") +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  scale_color_manual(values = c("Noise" = "lightgray", "Cluster 1" = "red", "Cluster 2" = "blue", 
+                               "Cluster 3" = "green", "Cluster 4" = "purple", "Cluster 5" = "orange",
+                               "Cluster 6" = "brown", "Cluster 7" = "pink", "Cluster 8" = "cyan"),
+                    name = "DBSCAN\nClusters")
+
+p2 <- ggplot(dbscan_plot_data, aes(x = PC1, y = PC2, color = DBSCAN_Manhattan)) +
+  geom_point(alpha = 0.7, size = 1.5) +
+  labs(title = "DBSCAN (Manhattan Distance)",
+       subtitle = paste("eps=", round(optimal_eps * 3.0, 2), ", Found", 
+                       length(unique(manhattan_clusters_subset[manhattan_clusters_subset != 0])), 
+                       "clusters +", sum(manhattan_clusters_subset == 0), "noise points"),
+       x = "First Principal Component", y = "Second Principal Component") +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  scale_color_manual(values = c("Noise" = "lightgray", "Cluster 1" = "red", "Cluster 2" = "blue", 
+                               "Cluster 3" = "green", "Cluster 4" = "purple", "Cluster 5" = "orange"),
+                    name = "DBSCAN\nClusters")
+
+p3 <- ggplot(dbscan_plot_data, aes(x = PC1, y = PC2, color = True_Sentiment)) +
+  geom_point(alpha = 0.7, size = 1.5) +
+  labs(title = "True Sentiment Labels",
+       subtitle = "Ground truth for comparison",
+       x = "First Principal Component", y = "Second Principal Component") +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  scale_color_brewer(palette = "Set2", name = "True\nSentiment")
+
+grid.arrange(p1, p2, p3, ncol = 2, nrow = 2,
+             top = "Figure 9: DBSCAN Clustering Results Analysis")
+```
+
+# Hierarchical Clustering Analysis
+
+```{r hierarchical_clustering}
+# Function to perform hierarchical clustering with different linkage methods
+perform_hierarchical_clustering <- function(data, distance_metric = "euclidean", 
+                                          sample_size = 1500) {
+  set.seed(2021)
+  sample_indices <- sample(nrow(data), min(sample_size, nrow(data)))
+  sample_data <- data[sample_indices, ]
+  
+  # Calculate distance matrix
+  tryCatch({
+    if (distance_metric == "euclidean") {
+      dist_matrix <- dist(sample_data, method = "euclidean")
+    } else if (distance_metric == "manhattan") {
+      dist_matrix <- dist(sample_data, method = "manhattan") 
+    } else if (distance_metric == "cosine") {
+      if (requireNamespace("proxy", quietly = TRUE)) {
+        dist_matrix <- proxy::dist(sample_data, method = "cosine")
+      } else {
+        dist_matrix <- calculate_cosine_distance(sample_data)
+      }
+    } else {
+      dist_matrix <- dist(sample_data, method = "minkowski", p = 3)
+    }
+  }, error = function(e) {
+    cat(sprintf("Error calculating %s distance, using Euclidean instead\n", distance_metric))
+    dist_matrix <- dist(sample_data, method = "euclidean")
+  })
+  
+  # Different linkage methods
+  linkage_methods <- c("complete", "average", "single", "ward.D2")
+  hclust_results <- list()
+  
+  for (method in linkage_methods) {
+    tryCatch({
+      if (method == "ward.D2" && distance_metric != "euclidean") {
+        next
+      }
+      hclust_results[[method]] <- hclust(dist_matrix, method = method)
+    }, error = function(e) {
+      cat(sprintf("Error with %s linkage: %s\n", method, e$message))
+    })
+  }
+  
+  return(list(
+    results = hclust_results,
+    sample_indices = sample_indices,
+    sample_data = sample_data,
+    distance_matrix = dist_matrix
+  ))
+}
+
+# Hierarchical clustering with different distance metrics
+hclust_euclidean <- perform_hierarchical_clustering(clustering_features_scaled, "euclidean")
+hclust_manhattan <- perform_hierarchical_clustering(clustering_features_scaled, "manhattan")
+hclust_cosine <- perform_hierarchical_clustering(clustering_features_scaled, "cosine")
+
+# Cut dendrograms to get clusters
+cut_height_analysis <- function(hclust_result, k = optimal_k) {
+  clusters <- cutree(hclust_result, k = k)
+  return(clusters)
+}
+
+# Get cluster assignments for different methods
+hclust_clusters <- list()
+for (distance in c("euclidean", "manhattan", "cosine")) {
+  hclust_clusters[[distance]] <- list()
+  hclust_obj <- get(paste0("hclust_", distance))
+  
+  for (method in names(hclust_obj$results)) {
+    hclust_clusters[[distance]][[method]] <- cut_height_analysis(hclust_obj$results[[method]])
+  }
+}
+
+# Table 10: Hierarchical Clustering Summary
+create_hclust_summary <- function() {
+  summary_data <- data.frame()
+  
+  for (distance in names(hclust_clusters)) {
+    for (method in names(hclust_clusters[[distance]])) {
+      clusters <- hclust_clusters[[distance]][[method]]
+      n_clusters <- length(unique(clusters))
+      cluster_sizes <- table(clusters)
+      
+      summary_data <- rbind(summary_data, data.frame(
+        Distance_Metric = distance,
+        Linkage_Method = method,
+        Num_Clusters = n_clusters,
+        Min_Cluster_Size = min(cluster_sizes),
+        Max_Cluster_Size = max(cluster_sizes),
+        Avg_Cluster_Size = round(mean(cluster_sizes), 1)
+      ))
+    }
+  }
+  
+  return(summary_data)
+}
+
+hclust_summary <- create_hclust_summary()
+knitr::kable(hclust_summary,
+             caption = "Table 10: Hierarchical Clustering Methods Comparison")
+```
+
+```{r hierarchical_dendrograms, fig.cap="Figure 8: Hierarchical Clustering Dendrograms"}
+# Figure 8: Dendrogram Visualization
+par(mfrow = c(2, 2), mar = c(4, 4, 3, 1))
+
+# Plot dendrograms for Euclidean distance with different linkage methods
+plot(hclust_euclidean$results$complete, main = "Complete Linkage (Euclidean)", 
+     cex = 0.6, hang = -1, labels = FALSE)
+rect.hclust(hclust_euclidean$results$complete, k = optimal_k, border = 2:6)
+
+plot(hclust_euclidean$results$average, main = "Average Linkage (Euclidean)", 
+     cex = 0.6, hang = -1, labels = FALSE)
+rect.hclust(hclust_euclidean$results$average, k = optimal_k, border = 2:6)
+
+plot(hclust_euclidean$results$single, main = "Single Linkage (Euclidean)", 
+     cex = 0.6, hang = -1, labels = FALSE)
+rect.hclust(hclust_euclidean$results$single, k = optimal_k, border = 2:6)
+
+plot(hclust_euclidean$results$ward.D2, main = "Ward Linkage (Euclidean)", 
+     cex = 0.6, hang = -1, labels = FALSE)
+rect.hclust(hclust_euclidean$results$ward.D2, k = optimal_k, border = 2:6)
+
+par(mfrow = c(1, 1))
+```
+
+
+# Clustering-Sentiment Relationship Analysis
+
+```{r clustering_sentiment_analysis}
+# Clustering-Sentiment Relationship Analysis (FIXED)
+# Analyze relationship between clusters and sentiment classes
+analyze_cluster_sentiment_relationship <- function(clusters, true_labels, method_name) {
+  # Ensure both have same length
+  min_length <- min(length(clusters), length(true_labels))
+  clusters <- clusters[1:min_length]
+  true_labels <- true_labels[1:min_length]
+  
+  # Create contingency table
+  if (any(clusters == 0)) {
+    # Handle noise points in DBSCAN
+    valid_indices <- clusters != 0
+    clean_clusters <- clusters[valid_indices]
+    clean_labels <- true_labels[valid_indices]
+    
+    if (length(clean_clusters) > 0) {
+      contingency <- table(clean_clusters, clean_labels)
+    } else {
+      contingency <- matrix(0, nrow = 1, ncol = 3,
+                           dimnames = list("NoCluster", c("0", "1", "2")))
+    }
+  } else {
+    contingency <- table(clusters, true_labels)
+  }
+  
+  # Calculate cluster purity
+  if (nrow(contingency) > 0 && ncol(contingency) > 0 && sum(contingency) > 0) {
+    cluster_purities <- apply(contingency, 1, function(row) {
+      if (sum(row) > 0) max(row) / sum(row) else 0
+    })
+    overall_purity <- sum(apply(contingency, 1, max)) / sum(contingency)
+  } else {
+    cluster_purities <- 0
+    overall_purity <- 0
+  }
+  
+  return(list(
+    method = method_name,
+    contingency = contingency,
+    cluster_purities = cluster_purities,
+    overall_purity = overall_purity,
+    sample_size = min_length
+  ))
+}
+
+# Analyze best performing methods with dimension fixes
+sentiment_analysis_results <- list()
+
+# Ensure consistent dimensions for analysis
+analysis_sample_size <- min(
+  length(final_kmeans_euclidean$cluster),
+  length(dbscan_euclidean$cluster),
+  length(true_labels)
+)
+
+cat(sprintf("Analysis sample size: %d (ensuring consistent dimensions)\n", analysis_sample_size))
+
+sentiment_analysis_results$kmeans_euclidean <- analyze_cluster_sentiment_relationship(
+  final_kmeans_euclidean$cluster[1:analysis_sample_size], 
+  true_labels[1:analysis_sample_size], 
+  "K-means (Euclidean)")
+
+sentiment_analysis_results$dbscan_euclidean <- analyze_cluster_sentiment_relationship(
+  dbscan_euclidean$cluster[1:analysis_sample_size], 
+  true_labels[1:analysis_sample_size], 
+  "DBSCAN (Euclidean)")
+
+# Add hierarchical clustering if available
+if (length(hclust_clusters$euclidean) > 0 && "ward.D2" %in% names(hclust_clusters$euclidean)) {
+  # Use sample indices from hierarchical clustering
+  hierarchical_sample_size <- length(hclust_clusters$euclidean$ward.D2)
+  ward_sample_labels <- true_labels[hclust_euclidean$sample_indices[1:hierarchical_sample_size]]
+  
+  sentiment_analysis_results$hierarchical_ward <- analyze_cluster_sentiment_relationship(
+    hclust_clusters$euclidean$ward.D2[1:hierarchical_sample_size], 
+    ward_sample_labels, 
+    "Hierarchical (Ward)")
+}
+
+# Create summary table
+cluster_sentiment_summary <- data.frame(
+  Method = character(),
+  Overall_Purity = numeric(),
+  Num_Clusters = numeric(),
+  Avg_Cluster_Size = numeric(),
+  Sample_Size = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (result in sentiment_analysis_results) {
+  contingency <- result$contingency
+  
+  cluster_sentiment_summary <- rbind(cluster_sentiment_summary, data.frame(
+    Method = result$method,
+    Overall_Purity = round(result$overall_purity, 4),
+    Num_Clusters = nrow(contingency),
+    Avg_Cluster_Size = round(mean(rowSums(contingency)), 1),
+    Sample_Size = result$sample_size,
+    stringsAsFactors = FALSE
+  ))
+}
+
+knitr::kable(cluster_sentiment_summary, caption = "Table 13: Cluster-Sentiment Relationship Analysis")
+
+# Display contingency table for best method
+if (nrow(cluster_sentiment_summary) > 0) {
+  best_method_index <- which.max(cluster_sentiment_summary$Overall_Purity)
+  if (length(best_method_index) > 0) {
+    best_result <- sentiment_analysis_results[[best_method_index]]
+    cat(sprintf("\nContingency Table for Best Method (%s):\n", best_result$method))
+    print(best_result$contingency)
+    
+    cat(sprintf("\nOverall Purity: %.4f", best_result$overall_purity))
+    cat(sprintf("\nSample Size: %d", best_result$sample_size))
+    if (length(best_result$cluster_purities) > 0 && !all(best_result$cluster_purities == 0)) {
+      cat("\nIndividual Cluster Purities:\n")
+      print(round(best_result$cluster_purities, 4))
+    }
+  }
+}
+```
